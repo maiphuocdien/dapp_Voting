@@ -2,6 +2,9 @@ import { useMemo, useState } from "react";
 import { ethers } from "ethers";
 import AttendanceRegistry from "./abi/AttendanceRegistry.json";
 import { CONTRACT_ADDRESS, REQUIRED_CHAIN_ID } from "./config";
+import heroBanner from "./assets/attendance-hero.svg";
+
+const REQUIRED_CHAIN_HEX = `0x${REQUIRED_CHAIN_ID.toString(16)}`;
 
 function toUnix(datetimeLocal) {
   if (!datetimeLocal) {
@@ -40,11 +43,75 @@ export default function App() {
     return `${account.slice(0, 6)}...${account.slice(-4)}`;
   }, [account]);
 
-  async function getProvider() {
-    if (!window.ethereum) {
+  const statusTone = useMemo(() => {
+    const normalized = status.toLowerCase();
+    if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("wrong")) {
+      return "error";
+    }
+    if (normalized.includes("success") || normalized.includes("loaded") || normalized.includes("connected")) {
+      return "success";
+    }
+    return "neutral";
+  }, [status]);
+
+  function getMetaMaskProviderObject() {
+    const ethereum = window.ethereum;
+    if (!ethereum) {
       throw new Error("MetaMask not found. Please install MetaMask.");
     }
-    return new ethers.BrowserProvider(window.ethereum);
+
+    if (Array.isArray(ethereum.providers) && ethereum.providers.length > 0) {
+      const metaMaskProvider = ethereum.providers.find((provider) => provider.isMetaMask);
+      if (!metaMaskProvider) {
+        throw new Error("MetaMask provider not found. Disable other wallet extensions and try again.");
+      }
+      return metaMaskProvider;
+    }
+
+    if (!ethereum.isMetaMask) {
+      throw new Error("Another wallet extension is active. Please use MetaMask.");
+    }
+
+    return ethereum;
+  }
+
+  async function ensureCorrectNetwork(metaMaskProvider) {
+    const currentChainHex = await metaMaskProvider.request({ method: "eth_chainId" });
+    if (currentChainHex?.toLowerCase() === REQUIRED_CHAIN_HEX.toLowerCase()) {
+      return;
+    }
+
+    try {
+      await metaMaskProvider.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: REQUIRED_CHAIN_HEX }]
+      });
+    } catch (switchError) {
+      if (switchError?.code === 4902) {
+        await metaMaskProvider.request({
+          method: "wallet_addEthereumChain",
+          params: [
+            {
+              chainId: REQUIRED_CHAIN_HEX,
+              chainName: "Hardhat Local",
+              rpcUrls: ["http://127.0.0.1:8545"],
+              nativeCurrency: {
+                name: "Ethereum",
+                symbol: "ETH",
+                decimals: 18
+              }
+            }
+          ]
+        });
+        return;
+      }
+      throw switchError;
+    }
+  }
+
+  async function getProvider() {
+    const metaMaskProvider = getMetaMaskProviderObject();
+    return new ethers.BrowserProvider(metaMaskProvider);
   }
 
   async function getContract(withSigner = false) {
@@ -55,6 +122,9 @@ export default function App() {
 
   async function connectWallet() {
     try {
+      const metaMaskProvider = getMetaMaskProviderObject();
+      await ensureCorrectNetwork(metaMaskProvider);
+
       const provider = await getProvider();
       const accounts = await provider.send("eth_requestAccounts", []);
       const network = await provider.getNetwork();
@@ -128,18 +198,21 @@ export default function App() {
 
   return (
     <div className="app">
-      <header>
+      <header className="hero">
+        <img className="hero-banner" src={heroBanner} alt="Blockchain Attendance DApp banner" />
         <h1>Attendance DApp</h1>
-        <p>Solidity + React + MetaMask + Ethers.js</p>
+        <p className="hero-subtitle">Solidity + React + MetaMask + Ethers.js</p>
       </header>
 
-      <section className="card">
+      <section className="card wallet-card">
         <h2>Wallet</h2>
-        <p><strong>Account:</strong> {shortAccount}</p>
-        <p><strong>Chain ID:</strong> {chainId ?? "-"}</p>
-        <p><strong>Required:</strong> {REQUIRED_CHAIN_ID}</p>
-        <p><strong>Contract:</strong> {CONTRACT_ADDRESS || "(missing in .env)"}</p>
-        <button onClick={connectWallet}>Connect MetaMask</button>
+        <div className="wallet-grid">
+          <p className="kv"><span>Account</span><code>{shortAccount}</code></p>
+          <p className="kv"><span>Chain ID</span><code>{chainId ?? "-"}</code></p>
+          <p className="kv"><span>Required</span><code>{REQUIRED_CHAIN_ID}</code></p>
+          <p className="kv"><span>Contract</span><code>{CONTRACT_ADDRESS || "(missing in .env)"}</code></p>
+        </div>
+        <button className="primary" onClick={connectWallet}>Connect MetaMask</button>
         {!networkOk && chainId !== null && (
           <p className="warning">Wrong network. Switch MetaMask to chain {REQUIRED_CHAIN_ID}.</p>
         )}
@@ -149,15 +222,15 @@ export default function App() {
         <h2>Create Session (Instructor)</h2>
         <input value={courseCode} onChange={(e) => setCourseCode(e.target.value)} placeholder="Course Code" />
         <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" />
-        <label>
+        <label className="form-field">
           Start Time
           <input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
         </label>
-        <label>
+        <label className="form-field">
           End Time
           <input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
         </label>
-        <button onClick={createSession} disabled={!networkOk}>Create Session</button>
+        <button className="primary" onClick={createSession} disabled={!networkOk}>Create Session</button>
       </section>
 
       <section className="card">
@@ -169,7 +242,7 @@ export default function App() {
           onChange={(e) => setMarkSessionId(e.target.value)}
           placeholder="Session ID"
         />
-        <button onClick={markAttendance} disabled={!networkOk}>Mark Attendance</button>
+        <button className="primary" onClick={markAttendance} disabled={!networkOk}>Mark Attendance</button>
       </section>
 
       <section className="card">
@@ -181,25 +254,25 @@ export default function App() {
           onChange={(e) => setViewSessionId(e.target.value)}
           placeholder="Session ID"
         />
-        <button onClick={loadSession}>Load Session</button>
+        <button className="primary" onClick={loadSession}>Load Session</button>
 
         {sessionData && (
           <div className="session-box">
-            <p><strong>ID:</strong> {sessionData.id.toString()}</p>
-            <p><strong>Course:</strong> {sessionData.courseCode}</p>
-            <p><strong>Title:</strong> {sessionData.title}</p>
-            <p><strong>Start:</strong> {formatUnix(sessionData.startTime)}</p>
-            <p><strong>End:</strong> {formatUnix(sessionData.endTime)}</p>
-            <p><strong>Instructor:</strong> {sessionData.instructor}</p>
-            <p><strong>Active:</strong> {sessionData.active ? "Yes" : "No"}</p>
-            <p><strong>Attendee Count:</strong> {attendeeCount ?? "-"}</p>
-            <p><strong>My Attendance:</strong> {myAttendance === null ? "-" : myAttendance ? "Marked" : "Not Marked"}</p>
+            <p className="kv"><span>ID</span><code>{sessionData.id.toString()}</code></p>
+            <p className="kv"><span>Course</span><code>{sessionData.courseCode}</code></p>
+            <p className="kv"><span>Title</span><code>{sessionData.title}</code></p>
+            <p className="kv"><span>Start</span><code>{formatUnix(sessionData.startTime)}</code></p>
+            <p className="kv"><span>End</span><code>{formatUnix(sessionData.endTime)}</code></p>
+            <p className="kv"><span>Instructor</span><code>{sessionData.instructor}</code></p>
+            <p className="kv"><span>Active</span><code>{sessionData.active ? "Yes" : "No"}</code></p>
+            <p className="kv"><span>Attendee Count</span><code>{attendeeCount ?? "-"}</code></p>
+            <p className="kv"><span>My Attendance</span><code>{myAttendance === null ? "-" : myAttendance ? "Marked" : "Not Marked"}</code></p>
           </div>
         )}
       </section>
 
       <footer>
-        <p>Status: {status}</p>
+        <p className={`status-pill ${statusTone}`}>Status: {status}</p>
       </footer>
     </div>
   );
