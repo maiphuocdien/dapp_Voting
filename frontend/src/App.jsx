@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ethers } from "ethers";
 import AttendanceRegistry from "./abi/AttendanceRegistry.json";
 import { CONTRACT_ADDRESS, REQUIRED_CHAIN_ID } from "./config";
@@ -7,26 +7,28 @@ import heroBanner from "./assets/attendance-hero.svg";
 const REQUIRED_CHAIN_HEX = `0x${REQUIRED_CHAIN_ID.toString(16)}`;
 
 function toUnix(datetimeLocal) {
-  if (!datetimeLocal) {
-    return 0;
-  }
+  if (!datetimeLocal) return 0;
   return Math.floor(new Date(datetimeLocal).getTime() / 1000);
 }
 
 function formatUnix(unixTs) {
-  if (!unixTs) {
-    return "-";
-  }
-  return new Date(Number(unixTs) * 1000).toLocaleString();
+  if (!unixTs) return "-";
+  return new Date(Number(unixTs) * 1000).toLocaleString("vi-VN");
+}
+
+function formatAddress(address) {
+  if (!address) return "-";
+  return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
 export default function App() {
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState(null);
-  const [status, setStatus] = useState("Ready");
+  const [status, setStatus] = useState("Sẵn sàng");
+  const [totalSessions, setTotalSessions] = useState(null);
 
   const [courseCode, setCourseCode] = useState("CS101");
-  const [title, setTitle] = useState("Week 1");
+  const [title, setTitle] = useState("Tuần 1");
   const [startAt, setStartAt] = useState("");
   const [endAt, setEndAt] = useState("");
 
@@ -36,40 +38,45 @@ export default function App() {
   const [myAttendance, setMyAttendance] = useState(null);
   const [attendeeCount, setAttendeeCount] = useState(null);
 
+  const summaryRef = useRef(null);
+  const createRef = useRef(null);
+  const attendanceRef = useRef(null);
+  const lookupRef = useRef(null);
+
+  const isConnected = Boolean(account);
   const networkOk = chainId === REQUIRED_CHAIN_ID;
 
-  const shortAccount = useMemo(() => {
-    if (!account) return "Not connected";
-    return `${account.slice(0, 6)}...${account.slice(-4)}`;
-  }, [account]);
+  const shortAccount = useMemo(() => formatAddress(account), [account]);
 
   const statusTone = useMemo(() => {
-    const normalized = status.toLowerCase();
-    if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("wrong")) {
+    const value = status.toLowerCase();
+    if (value.includes("lỗi") || value.includes("fail") || value.includes("error") || value.includes("wrong")) {
       return "error";
     }
-    if (normalized.includes("success") || normalized.includes("loaded") || normalized.includes("connected")) {
+    if (value.includes("thành công") || value.includes("loaded") || value.includes("connected") || value.includes("kết nối")) {
       return "success";
     }
     return "neutral";
   }, [status]);
 
+  const networkLabel = networkOk ? "Hardhat Local" : chainId ? `Chuỗi ${chainId}` : "Chưa kết nối";
+
   function getMetaMaskProviderObject() {
     const ethereum = window.ethereum;
     if (!ethereum) {
-      throw new Error("MetaMask not found. Please install MetaMask.");
+      throw new Error("Không tìm thấy MetaMask. Vui lòng cài đặt MetaMask.");
     }
 
     if (Array.isArray(ethereum.providers) && ethereum.providers.length > 0) {
       const metaMaskProvider = ethereum.providers.find((provider) => provider.isMetaMask);
       if (!metaMaskProvider) {
-        throw new Error("MetaMask provider not found. Disable other wallet extensions and try again.");
+        throw new Error("Không tìm thấy provider của MetaMask. Hãy tắt các ví khác rồi thử lại.");
       }
       return metaMaskProvider;
     }
 
     if (!ethereum.isMetaMask) {
-      throw new Error("Another wallet extension is active. Please use MetaMask.");
+      throw new Error("Đang có ví khác chiếm quyền. Vui lòng dùng MetaMask.");
     }
 
     return ethereum;
@@ -110,14 +117,24 @@ export default function App() {
   }
 
   async function getProvider() {
-    const metaMaskProvider = getMetaMaskProviderObject();
-    return new ethers.BrowserProvider(metaMaskProvider);
+    return new ethers.BrowserProvider(getMetaMaskProviderObject());
   }
 
   async function getContract(withSigner = false) {
     const provider = await getProvider();
     const runner = withSigner ? await provider.getSigner() : provider;
     return new ethers.Contract(CONTRACT_ADDRESS, AttendanceRegistry.abi, runner);
+  }
+
+  async function refreshDashboard(provider) {
+    if (!CONTRACT_ADDRESS || CONTRACT_ADDRESS.length < 10) {
+      return;
+    }
+
+    const activeProvider = provider ?? (await getProvider());
+    const contract = new ethers.Contract(CONTRACT_ADDRESS, AttendanceRegistry.abi, activeProvider);
+    const nextSessionId = await contract.nextSessionId();
+    setTotalSessions(Number(nextSessionId));
   }
 
   async function connectWallet() {
@@ -131,50 +148,82 @@ export default function App() {
 
       setAccount(accounts[0] || "");
       setChainId(Number(network.chainId));
-      setStatus("Wallet connected.");
+      await refreshDashboard(provider);
+      setStatus("Đã kết nối ví thành công.");
     } catch (error) {
-      setStatus(error.message || "Failed to connect wallet");
+      setStatus(error.message || "Kết nối ví thất bại.");
+    }
+  }
+
+  async function disconnectWallet() {
+    try {
+      const metaMaskProvider = getMetaMaskProviderObject();
+      if (metaMaskProvider?.request) {
+        try {
+          await metaMaskProvider.request({
+            method: "wallet_revokePermissions",
+            params: [{ eth_accounts: {} }]
+          });
+        } catch {
+          // Một số phiên bản MetaMask không hỗ trợ revokePermissions.
+        }
+      }
+    } finally {
+      setAccount("");
+      setChainId(null);
+      setSessionData(null);
+      setAttendeeCount(null);
+      setMyAttendance(null);
+      setTotalSessions(null);
+      setStatus("Đã đăng xuất ví.");
     }
   }
 
   async function createSession() {
     try {
       if (!CONTRACT_ADDRESS || CONTRACT_ADDRESS.length < 10) {
-        throw new Error("Set VITE_CONTRACT_ADDRESS in frontend/.env first.");
+        throw new Error("Thiếu địa chỉ contract trong `frontend/.env`.");
       }
+
       const startTime = toUnix(startAt);
       const endTime = toUnix(endAt);
+
       if (!startTime || !endTime) {
-        throw new Error("Please choose valid start and end time.");
+        throw new Error("Vui lòng chọn giờ bắt đầu và kết thúc hợp lệ.");
       }
+
       const contract = await getContract(true);
-      setStatus("Submitting createSession transaction...");
+      setStatus("Đang tạo buổi điểm danh...");
       const tx = await contract.createSession(courseCode, title, startTime, endTime);
       await tx.wait();
-      setStatus("Session created successfully.");
+      await refreshDashboard();
+      setStatus("Tạo buổi điểm danh thành công.");
     } catch (error) {
-      setStatus(error.reason || error.shortMessage || error.message || "Create session failed");
+      setStatus(error.reason || error.shortMessage || error.message || "Tạo buổi điểm danh thất bại.");
     }
   }
 
   async function markAttendance() {
     try {
       const contract = await getContract(true);
-      setStatus("Submitting markAttendance transaction...");
+      setStatus("Đang gửi giao dịch điểm danh...");
       const tx = await contract.markAttendance(markSessionId);
       await tx.wait();
-      setStatus("Attendance marked successfully.");
+      await refreshDashboard();
+      setStatus("Điểm danh thành công.");
     } catch (error) {
-      setStatus(error.reason || error.shortMessage || error.message || "Mark attendance failed");
+      setStatus(error.reason || error.shortMessage || error.message || "Điểm danh thất bại.");
     }
   }
 
   async function loadSession() {
     try {
       const contract = await getContract(false);
+      const provider = await getProvider();
       const [session, total] = await Promise.all([
         contract.getSession(viewSessionId),
-        contract.getAttendeeCount(viewSessionId)
+        contract.getAttendeeCount(viewSessionId),
+        refreshDashboard(provider)
       ]);
 
       setSessionData(session);
@@ -187,9 +236,9 @@ export default function App() {
         setMyAttendance(null);
       }
 
-      setStatus("Session loaded.");
+      setStatus("Đã tải thông tin buổi học.");
     } catch (error) {
-      setStatus(error.reason || error.shortMessage || error.message || "Load session failed");
+      setStatus(error.reason || error.shortMessage || error.message || "Tải buổi học thất bại.");
       setSessionData(null);
       setAttendeeCount(null);
       setMyAttendance(null);
@@ -197,82 +246,172 @@ export default function App() {
   }
 
   return (
-    <div className="app">
-      <header className="hero">
-        <img className="hero-banner" src={heroBanner} alt="Blockchain Attendance DApp banner" />
-        <h1>Attendance DApp</h1>
-        <p className="hero-subtitle">Solidity + React + MetaMask + Ethers.js</p>
+    <div className="app dashboard-shell">
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
+
+      <header className="topbar card">
+        <div className="brand">
+          <div className="brand-mark">A</div>
+          <div>
+            <h1>Attendance DApp</h1>
+            <p>Hệ thống điểm danh trên Blockchain</p>
+          </div>
+        </div>
+
+        <div className="topbar-actions">
+          <div className="nav-badge">
+            <span>Ví</span>
+            <strong>{isConnected ? shortAccount : "Chưa kết nối"}</strong>
+          </div>
+          <button className="ghost" onClick={isConnected ? disconnectWallet : connectWallet}>
+            {isConnected ? "Đăng xuất" : "Kết nối ví"}
+          </button>
+        </div>
       </header>
 
-      <section className="card wallet-card">
-        <h2>Wallet</h2>
-        <div className="wallet-grid">
-          <p className="kv"><span>Account</span><code>{shortAccount}</code></p>
-          <p className="kv"><span>Chain ID</span><code>{chainId ?? "-"}</code></p>
-          <p className="kv"><span>Required</span><code>{REQUIRED_CHAIN_ID}</code></p>
-          <p className="kv"><span>Contract</span><code>{CONTRACT_ADDRESS || "(missing in .env)"}</code></p>
+      <section className="network-strip card" ref={summaryRef}>
+        <div className="network-strip-left">
+          <p className="section-label">Mạng</p>
+          <h2>{networkLabel}</h2>
+          <p className="muted">Môi trường local để kiểm thử điểm danh.</p>
         </div>
-        <button className="primary" onClick={connectWallet}>Connect MetaMask</button>
-        {!networkOk && chainId !== null && (
-          <p className="warning">Wrong network. Switch MetaMask to chain {REQUIRED_CHAIN_ID}.</p>
-        )}
+
+        <div className={`status-pill ${networkOk ? "success" : "error"}`}>
+          {networkOk ? "Đúng mạng Hardhat Local" : "Sai network"}
+        </div>
       </section>
 
-      <section className="card">
-        <h2>Create Session (Instructor)</h2>
-        <input value={courseCode} onChange={(e) => setCourseCode(e.target.value)} placeholder="Course Code" />
-        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" />
-        <label className="form-field">
-          Start Time
-          <input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
-        </label>
-        <label className="form-field">
-          End Time
-          <input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
-        </label>
-        <button className="primary" onClick={createSession} disabled={!networkOk}>Create Session</button>
-      </section>
+      <section className="hero card">
+        <div className="hero-copy">
+          <p className="section-label">Tổng quan</p>
+          <h2>Bảng điều khiển điểm danh</h2>
+          <p className="muted">
+            Quản lý buổi học, điểm danh sinh viên và tra cứu trạng thái on-chain với giao diện dashboard rõ ràng, dễ dùng.
+          </p>
 
-      <section className="card">
-        <h2>Mark Attendance (Student)</h2>
-        <input
-          type="number"
-          min="0"
-          value={markSessionId}
-          onChange={(e) => setMarkSessionId(e.target.value)}
-          placeholder="Session ID"
-        />
-        <button className="primary" onClick={markAttendance} disabled={!networkOk}>Mark Attendance</button>
-      </section>
-
-      <section className="card">
-        <h2>Session Lookup</h2>
-        <input
-          type="number"
-          min="0"
-          value={viewSessionId}
-          onChange={(e) => setViewSessionId(e.target.value)}
-          placeholder="Session ID"
-        />
-        <button className="primary" onClick={loadSession}>Load Session</button>
-
-        {sessionData && (
-          <div className="session-box">
-            <p className="kv"><span>ID</span><code>{sessionData.id.toString()}</code></p>
-            <p className="kv"><span>Course</span><code>{sessionData.courseCode}</code></p>
-            <p className="kv"><span>Title</span><code>{sessionData.title}</code></p>
-            <p className="kv"><span>Start</span><code>{formatUnix(sessionData.startTime)}</code></p>
-            <p className="kv"><span>End</span><code>{formatUnix(sessionData.endTime)}</code></p>
-            <p className="kv"><span>Instructor</span><code>{sessionData.instructor}</code></p>
-            <p className="kv"><span>Active</span><code>{sessionData.active ? "Yes" : "No"}</code></p>
-            <p className="kv"><span>Attendee Count</span><code>{attendeeCount ?? "-"}</code></p>
-            <p className="kv"><span>My Attendance</span><code>{myAttendance === null ? "-" : myAttendance ? "Marked" : "Not Marked"}</code></p>
+          <div className="hero-actions">
+            <button className="primary" onClick={connectWallet}>Kết nối MetaMask</button>
+            <button className="ghost" onClick={() => summaryRef.current?.scrollIntoView({ behavior: "smooth" })}>
+              Xem tổng quan
+            </button>
           </div>
-        )}
+        </div>
+
+        <img className="hero-banner" src={heroBanner} alt="Banner Attendance DApp" />
       </section>
 
-      <footer>
-        <p className={`status-pill ${statusTone}`}>Status: {status}</p>
+      <section className="summary-grid">
+        <article className="summary-card summary-purple">
+          <span>Tổng số buổi</span>
+          <strong>{totalSessions ?? "-"}</strong>
+        </article>
+        <article className="summary-card summary-green">
+          <span>Session đang xem</span>
+          <strong>{viewSessionId || "0"}</strong>
+        </article>
+        <article className="summary-card summary-blue">
+          <span>Lượt điểm danh</span>
+          <strong>{attendeeCount ?? 0}</strong>
+        </article>
+        <article className="summary-card summary-orange">
+          <span>Ví kết nối</span>
+          <strong>{isConnected ? shortAccount : "N/A"}</strong>
+        </article>
+      </section>
+
+      <nav className="section-tabs card">
+        <button onClick={() => summaryRef.current?.scrollIntoView({ behavior: "smooth" })}>📊 Tổng quan</button>
+        <button onClick={() => createRef.current?.scrollIntoView({ behavior: "smooth" })}>🧑‍🏫 Tạo buổi học</button>
+        <button onClick={() => attendanceRef.current?.scrollIntoView({ behavior: "smooth" })}>🧾 Điểm danh</button>
+        <button onClick={() => lookupRef.current?.scrollIntoView({ behavior: "smooth" })}>🔎 Tra cứu</button>
+      </nav>
+
+      <section className="card module-card" ref={createRef}>
+        <div className="module-head">
+          <div>
+            <p className="section-label">Quản lý buổi học</p>
+            <h2>Tạo buổi điểm danh</h2>
+          </div>
+          <div className="module-tag">Giảng viên</div>
+        </div>
+
+        <div className="form-stack">
+          <input value={courseCode} onChange={(e) => setCourseCode(e.target.value)} placeholder="Mã môn học" />
+          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Tên buổi học" />
+          <label className="form-field">
+            Thời gian bắt đầu
+            <input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} />
+          </label>
+          <label className="form-field">
+            Thời gian kết thúc
+            <input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} />
+          </label>
+          <button className="primary" onClick={createSession} disabled={!networkOk}>Tạo buổi học</button>
+        </div>
+      </section>
+
+      <div className="two-column-grid">
+        <section className="card module-card" ref={attendanceRef}>
+          <div className="module-head">
+            <div>
+              <p className="section-label">Điểm danh</p>
+              <h2>Điểm danh sinh viên</h2>
+            </div>
+            <div className="module-tag module-tag-teal">Sinh viên</div>
+          </div>
+
+          <div className="form-stack">
+            <input
+              type="number"
+              min="0"
+              value={markSessionId}
+              onChange={(e) => setMarkSessionId(e.target.value)}
+              placeholder="Session ID"
+            />
+            <button className="primary" onClick={markAttendance} disabled={!networkOk}>Điểm danh</button>
+          </div>
+        </section>
+
+        <section className="card module-card" ref={lookupRef}>
+          <div className="module-head">
+            <div>
+              <p className="section-label">Tra cứu</p>
+              <h2>Xem chi tiết buổi học</h2>
+            </div>
+            <div className="module-tag module-tag-indigo">Chỉ xem</div>
+          </div>
+
+          <div className="form-stack">
+            <input
+              type="number"
+              min="0"
+              value={viewSessionId}
+              onChange={(e) => setViewSessionId(e.target.value)}
+              placeholder="Session ID"
+            />
+            <button className="primary" onClick={loadSession}>Tải thông tin</button>
+          </div>
+
+          {sessionData && (
+            <div className="session-box session-grid">
+              <p className="kv"><span>ID</span><code>{sessionData.id.toString()}</code></p>
+              <p className="kv"><span>Mã môn</span><code>{sessionData.courseCode}</code></p>
+              <p className="kv"><span>Tên buổi</span><code>{sessionData.title}</code></p>
+              <p className="kv"><span>Bắt đầu</span><code>{formatUnix(sessionData.startTime)}</code></p>
+              <p className="kv"><span>Kết thúc</span><code>{formatUnix(sessionData.endTime)}</code></p>
+              <p className="kv"><span>Giảng viên</span><code>{formatAddress(sessionData.instructor)}</code></p>
+              <p className="kv"><span>Đang mở</span><code>{sessionData.active ? "Có" : "Không"}</code></p>
+              <p className="kv"><span>Số người điểm danh</span><code>{attendeeCount ?? "-"}</code></p>
+              <p className="kv"><span>Trạng thái của tôi</span><code>{myAttendance === null ? "-" : myAttendance ? "Đã điểm danh" : "Chưa điểm danh"}</code></p>
+            </div>
+          )}
+        </section>
+      </div>
+
+      <footer className="footer-row">
+        <p className={`status-pill ${statusTone}`}>Trạng thái: {status}</p>
+        <p className="muted footer-contract">Contract: {CONTRACT_ADDRESS || "(thiếu trong .env)"}</p>
       </footer>
     </div>
   );
